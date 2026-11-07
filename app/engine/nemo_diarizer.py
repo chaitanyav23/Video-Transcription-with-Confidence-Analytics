@@ -112,22 +112,52 @@ class NemoMsddDiarizer:
         if not audio_path.exists():
             return [], "DIARIZATION_FAILED", f"Audio file not found: {audio_path}", {}
 
-        temp_dir_obj = None
+        file_id = audio_path.stem
+
+        # Short-circuit if empty VAD intervals provided
+        if vad_intervals is not None and len(vad_intervals) == 0:
+            logger.info("Empty VAD intervals provided for '%s'; short-circuiting without worker invocation.", file_id)
+            stats = {
+                "speaker_count": 0,
+                "speakers": [],
+                "turn_count": 0,
+                "total_speech_seconds": 0.0,
+                "inference_time_seconds": 0.0,
+            }
+            return [], "NO_SPEECH", "No speech intervals detected by VAD.", stats
+
+        # Short-circuit if empty VAD RTTM provided
+        if vad_rttm is not None and vad_rttm.exists():
+            existing_turns = self.parse_rttm(vad_rttm)
+            if len(existing_turns) == 0:
+                logger.info("Empty VAD RTTM provided for '%s'; short-circuiting without worker invocation.", file_id)
+                stats = {
+                    "speaker_count": 0,
+                    "speakers": [],
+                    "turn_count": 0,
+                    "total_speech_seconds": 0.0,
+                    "inference_time_seconds": 0.0,
+                }
+                return [], "NO_SPEECH", "VAD RTTM contains 0 speech intervals.", stats
+
+        temp_dir_obj: Optional[tempfile.TemporaryDirectory] = None
+        unique_work_dir: Path
         if out_dir is None:
-            temp_dir_obj = tempfile.TemporaryDirectory(prefix="nemo_diar_")
-            work_dir = Path(temp_dir_obj.name)
+            temp_dir_obj = tempfile.TemporaryDirectory(prefix=f"nemo_diar_{file_id}_")
+            unique_work_dir = Path(temp_dir_obj.name).resolve()
         else:
-            work_dir = out_dir
-            work_dir.mkdir(parents=True, exist_ok=True)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            import time
+            unique_name = f"run_{file_id}_{os.getpid()}_{int(time.time() * 1000)}"
+            unique_work_dir = (out_dir / unique_name).resolve()
+            unique_work_dir.mkdir(parents=True, exist_ok=True)
 
         try:
-            file_id = audio_path.stem
-
             # Prepare speech-only VAD RTTM
             if vad_rttm is not None and vad_rttm.exists():
                 active_vad_rttm = vad_rttm
             elif vad_intervals is not None:
-                active_vad_rttm = work_dir / f"{file_id}_oracle_vad.rttm"
+                active_vad_rttm = unique_work_dir / f"{file_id}_oracle_vad.rttm"
                 self.generate_oracle_vad_rttm(vad_intervals, active_vad_rttm, file_id)
             else:
                 return [], "DIARIZATION_FAILED", "Neither vad_intervals nor vad_rttm provided.", {}
@@ -140,7 +170,7 @@ class NemoMsddDiarizer:
                 "--vad-rttm",
                 str(active_vad_rttm.resolve()),
                 "--out-dir",
-                str(work_dir.resolve()),
+                str(unique_work_dir),
                 "--checkpoint",
                 str(self.checkpoint_path.resolve()),
                 "--max-speakers",
@@ -149,7 +179,7 @@ class NemoMsddDiarizer:
                 self.device,
             ]
 
-            logger.info("Spawning NeMo diarization worker: %s", " ".join(cmd[:4]) + " ...")
+            logger.info("Spawning NeMo diarization worker in isolated workspace: %s", unique_work_dir)
             proc = subprocess.run(
                 cmd,
                 stdout=subprocess.PIPE,
@@ -163,31 +193,95 @@ class NemoMsddDiarizer:
                 logger.error("NeMo diarization worker failed (exit code %d): %s", proc.returncode, err_msg)
                 return [], "DIARIZATION_FAILED", f"Worker exited with code {proc.returncode}: {err_msg[:400]}", {}
 
-            # Parse worker JSON output from stdout
-            worker_meta = {}
-            for line in proc.stdout.strip().splitlines():
+            # Strict worker JSON protocol validation
+            json_lines = []
+            for line in proc.stdout.splitlines():
                 line_str = line.strip()
                 if line_str.startswith("{") and line_str.endswith("}"):
-                    try:
-                        worker_meta = json.loads(line_str)
-                        break
-                    except Exception:
-                        pass
+                    json_lines.append(line_str)
 
-            rttm_path = work_dir / "predicted.rttm"
-            if not rttm_path.exists():
-                if "rttm_path" in worker_meta:
-                    rttm_path = Path(worker_meta["rttm_path"])
+            if not json_lines:
+                logger.error("Worker exited with code 0 but emitted no JSON payload.")
+                return [], "DIARIZATION_FAILED", "Worker completed but emitted no structured JSON response.", {}
 
-            if not rttm_path.exists():
-                return [], "DIARIZATION_FAILED", "Worker completed but predicted.rttm was not found.", worker_meta
+            try:
+                worker_meta = json.loads(json_lines[-1])
+            except Exception as exc:
+                logger.error("Worker emitted malformed JSON: %s", exc)
+                return [], "DIARIZATION_FAILED", f"Worker emitted malformed JSON response: {exc}", {}
 
-            segments = self.parse_rttm(rttm_path)
+            if not isinstance(worker_meta, dict):
+                return [], "DIARIZATION_FAILED", "Worker JSON response is not a valid dictionary.", {}
+
+            worker_status = worker_meta.get("status")
+            VALID_STATUSES = {"SUCCESS", "NO_SPEECH", "FAILED"}
+            if worker_status not in VALID_STATUSES:
+                logger.error("Unrecognized worker status: %s", worker_status)
+                return [], "DIARIZATION_FAILED", f"Unrecognized worker status: '{worker_status}'.", worker_meta
+
+            if worker_status == "FAILED":
+                err = worker_meta.get("error", "Unspecified worker failure")
+                logger.error("Worker reported FAILED status: %s", err)
+                return [], "DIARIZATION_FAILED", f"Worker reported failure: {err}", worker_meta
+
+            if worker_status == "NO_SPEECH":
+                logger.info("Worker reported NO_SPEECH for audio '%s'", file_id)
+                stats = {
+                    "speaker_count": 0,
+                    "speakers": [],
+                    "turn_count": 0,
+                    "total_speech_seconds": 0.0,
+                    "inference_time_seconds": worker_meta.get("inference_time_seconds", 0.0),
+                }
+                return [], "NO_SPEECH", worker_meta.get("reason", "No speech intervals detected by VAD."), stats
+
+            # For SUCCESS status, validate RTTM path existence and workspace provenance
+            raw_rttm_path = worker_meta.get("rttm_path")
+            if not raw_rttm_path or not isinstance(raw_rttm_path, str):
+                return [], "DIARIZATION_FAILED", "Worker reported SUCCESS but omitted 'rttm_path'.", worker_meta
+
+            rttm_path = Path(raw_rttm_path).resolve()
+
+            # Workspace provenance check: rttm_path must reside within unique_work_dir
+            try:
+                rttm_path.relative_to(unique_work_dir)
+            except ValueError:
+                logger.error("Provenance violation: RTTM path '%s' is outside invocation workspace '%s'", rttm_path, unique_work_dir)
+                return [], "DIARIZATION_FAILED", f"Worker returned RTTM outside invocation workspace: {rttm_path}", worker_meta
+
+            if not rttm_path.is_file():
+                return [], "DIARIZATION_FAILED", f"Worker output RTTM does not exist as a regular file: {rttm_path}", worker_meta
+
+            try:
+                segments = self.parse_rttm(rttm_path)
+            except Exception as exc:
+                return [], "DIARIZATION_FAILED", f"Failed to parse worker output RTTM: {exc}", worker_meta
+
+            if not segments:
+                logger.info("Worker RTTM parsed to 0 segments; returning NO_SPEECH.")
+                stats = {
+                    "speaker_count": 0,
+                    "speakers": [],
+                    "turn_count": 0,
+                    "total_speech_seconds": 0.0,
+                    "inference_time_seconds": worker_meta.get("inference_time_seconds", 0.0),
+                }
+                return [], "NO_SPEECH", "Worker produced empty RTTM with zero speaker segments.", stats
+
+            # Validate metadata consistency
+            speaker_count = worker_meta.get("speaker_count")
+            if speaker_count is None or not isinstance(speaker_count, int):
+                speaker_count = len({s["speaker"] for s in segments})
+
+            speakers = worker_meta.get("speakers")
+            if not isinstance(speakers, list):
+                speakers = sorted(list({s["speaker"] for s in segments}))
+
             stats = {
-                "speaker_count": worker_meta.get("speaker_count", len({s["speaker"] for s in segments})),
-                "speakers": worker_meta.get("speakers", sorted(list({s["speaker"] for s in segments}))),
+                "speaker_count": speaker_count,
+                "speakers": speakers,
                 "turn_count": len(segments),
-                "rttm_path": str(rttm_path.resolve()),
+                "rttm_path": str(rttm_path),
                 "inference_time_seconds": worker_meta.get("inference_time_seconds", 0.0),
             }
 
@@ -201,8 +295,6 @@ class NemoMsddDiarizer:
             return [], "DIARIZATION_FAILED", str(exc), {}
         finally:
             if temp_dir_obj is not None:
-                # Retain predicted RTTM if caller didn't specify out_dir?
-                # caller might need RTTM, but parse_rttm already parsed segments into memory.
                 try:
                     temp_dir_obj.cleanup()
                 except Exception:

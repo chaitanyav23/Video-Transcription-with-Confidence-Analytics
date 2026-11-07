@@ -117,12 +117,11 @@ def main() -> int:
     # 2. Check if VAD RTTM contains any speech intervals
     vad_stats = parse_rttm_stats(args.vad_rttm)
     if vad_stats["turn_count"] == 0:
-        logger.warning("VAD RTTM contains 0 speech intervals. Emitting empty RTTM.")
-        dest_rttm = args.out_dir / "predicted.rttm"
-        dest_rttm.write_text("", encoding="utf-8")
+        logger.warning("VAD RTTM contains 0 speech intervals. Short-circuiting without model loading.")
         out_meta = {
-            "status": "SUCCESS",
-            "rttm_path": str(dest_rttm.resolve()),
+            "status": "NO_SPEECH",
+            "reason": "VAD RTTM contains 0 speech intervals.",
+            "rttm_path": None,
             "speaker_count": 0,
             "speakers": [],
             "turn_count": 0,
@@ -229,18 +228,18 @@ def main() -> int:
     t_infer = time.time() - t_infer_start
     logger.info("Inference completed in %.2fs", t_infer)
 
-    # 7. Locate Generated RTTM
+    # 7. Locate Expected Generated RTTM for Current Audio
     pred_rttms_dir = args.out_dir / "pred_rttms"
-    candidates = sorted(pred_rttms_dir.glob("*.rttm"))
-    if not candidates:
-        logger.error("No RTTM produced under %s", pred_rttms_dir)
-        print(json.dumps({"status": "FAILED", "error": f"No RTTM generated under {pred_rttms_dir}"}))
+    expected_rttm = pred_rttms_dir / f"{file_id}.rttm"
+    if not expected_rttm.is_file():
+        logger.error("Expected RTTM for '%s' was not produced at: %s", file_id, expected_rttm)
+        print(json.dumps({"status": "FAILED", "error": f"Expected RTTM not found: {expected_rttm}"}))
         return 6
 
-    # Promote to canonical output destination
+    # Promote strictly the verified output to canonical destination
     dest_rttm = args.out_dir / "predicted.rttm"
-    shutil.copy2(candidates[0], dest_rttm)
-    logger.info("Promoted predicted RTTM to: %s", dest_rttm)
+    shutil.copy2(expected_rttm, dest_rttm)
+    logger.info("Promoted verified output '%s' to: %s", expected_rttm.name, dest_rttm)
 
     # 8. Clean intermediate files if requested
     if not args.keep_intermediate:
@@ -254,8 +253,9 @@ def main() -> int:
 
     # 9. Return structured JSON payload on stdout
     stats = parse_rttm_stats(dest_rttm)
+    final_status = "SUCCESS" if stats["turn_count"] > 0 else "NO_SPEECH"
     payload = {
-        "status": "SUCCESS",
+        "status": final_status,
         "rttm_path": str(dest_rttm.resolve()),
         "speaker_count": stats["speaker_count"],
         "speakers": stats["speakers"],

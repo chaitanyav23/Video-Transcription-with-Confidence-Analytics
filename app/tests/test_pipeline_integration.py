@@ -199,8 +199,14 @@ def test_empty_transcript_handling(dummy_audio_16k: Path):
 
 
 def test_diarization_blocker_disclosure(dummy_audio_16k: Path):
-    """Verify that absent NeMo MSDD assigns SPEAKER_UNASSIGNED and sets explicit blocker."""
-    engine = Phase20SpeechEngine(model_size="tiny", device="cpu", compute_type="int8", hf_token=None)
+    """Verify that absent/disabled diarization assigns SPEAKER_UNASSIGNED and sets explicit blocker."""
+    engine = Phase20SpeechEngine(
+        model_size="tiny",
+        device="cpu",
+        compute_type="int8",
+        hf_token=None,
+        enable_diarization=False,
+    )
 
     mock_whisper = MagicMock()
     mock_seg = MagicMock()
@@ -218,7 +224,6 @@ def test_diarization_blocker_disclosure(dummy_audio_16k: Path):
     ]
     engine._aligner = mock_aligner
 
-    engine.enable_diarization = False
     result = engine.transcribe(dummy_audio_16k, recording_id="diar_blocker_test")
 
     # All words must be attributed to SPEAKER_UNASSIGNED
@@ -228,8 +233,183 @@ def test_diarization_blocker_disclosure(dummy_audio_16k: Path):
     for turn in result.segments:
         assert turn.speaker == "SPEAKER_UNASSIGNED"
 
-    assert result.summary["diarization_status"] in ("DIARIZATION_UNAVAILABLE", "UNAVAILABLE_PENDING_MSDD")
-    assert "NeMo" in result.summary["diarization_blocker"]
+    assert result.summary["diarization_status"] == "DIARIZATION_UNAVAILABLE"
+    assert "disabled by configuration" in result.summary["diarization_blocker"].lower()
+
+
+def test_enable_diarization_flag_preservation():
+    """Verify that enable_diarization constructor flag is preserved and not overwritten."""
+    engine_off = Phase20SpeechEngine(model_size="tiny", enable_diarization=False)
+    assert engine_off.enable_diarization is False
+
+    engine_on = Phase20SpeechEngine(model_size="tiny", enable_diarization=True)
+    assert engine_on.enable_diarization is True
+
+
+def test_disabled_diarization_bypasses_all_backends(dummy_audio_16k: Path):
+    """Verify that enable_diarization=False bypasses NeMo, Pyannote, and avoids loading models."""
+    engine = Phase20SpeechEngine(
+        model_size="tiny",
+        device="cpu",
+        compute_type="int8",
+        hf_token="fake_hf_token_must_not_be_used",
+        enable_diarization=False,
+    )
+
+    mock_whisper = MagicMock()
+    mock_seg = MagicMock()
+    mock_seg.start = 0.0
+    mock_seg.end = 1.0
+    mock_seg.text = "TEST SPEECH"
+    mock_seg.avg_logprob = -0.2
+    mock_whisper.transcribe.return_value = ([mock_seg], MagicMock())
+    engine._whisper_model = mock_whisper
+
+    mock_aligner = MagicMock()
+    mock_aligner.align_segment.return_value = [
+        {"word": "TEST", "start": 0.1, "end": 0.4, "confidence": 0.9},
+        {"word": "SPEECH", "start": 0.5, "end": 0.9, "confidence": 0.9},
+    ]
+    engine._aligner = mock_aligner
+
+    # Mock NeMo adapter and Pyannote to raise if invoked
+    mock_nemo = MagicMock()
+    mock_nemo.diarize.side_effect = RuntimeError("NeMo must not be called when diarization is disabled!")
+    engine._nemo_diarizer = mock_nemo
+
+    with patch("pyannote.audio.Pipeline.from_pretrained", side_effect=RuntimeError("Pyannote must not be called!")):
+        result = engine.transcribe(dummy_audio_16k, recording_id="bypass_test")
+
+    mock_nemo.diarize.assert_not_called()
+    assert result.summary["diarization_status"] == "DIARIZATION_UNAVAILABLE"
+    assert result.summary["diarization_blocker"] == "Diarization disabled by configuration."
+    assert result.summary["speakers_detected"] == 0
+    assert result.speakers == []
+    for w in result.words:
+        assert w.speaker == "SPEAKER_UNASSIGNED"
+
+
+@patch("faster_whisper.vad.get_speech_timestamps")
+def test_vad_failure_stops_diarization_without_asr_fallback(mock_get_vad, dummy_audio_16k: Path):
+    """Verify that VAD failure aborts NeMo diarization and never falls back to ASR segments."""
+    engine = Phase20SpeechEngine(
+        model_size="tiny",
+        device="cpu",
+        compute_type="int8",
+        enable_diarization=True,
+    )
+
+    mock_whisper = MagicMock()
+    mock_seg = MagicMock()
+    mock_seg.start = 0.2
+    mock_seg.end = 1.5
+    mock_seg.text = "RAW ASR SEGMENT"
+    mock_seg.avg_logprob = -0.2
+    mock_whisper.transcribe.return_value = ([mock_seg], MagicMock())
+    engine._whisper_model = mock_whisper
+
+    mock_aligner = MagicMock()
+    mock_aligner.align_segment.return_value = [
+        {"word": "RAW", "start": 0.2, "end": 0.5, "confidence": 0.9},
+        {"word": "ASR", "start": 0.6, "end": 0.9, "confidence": 0.9},
+        {"word": "SEGMENT", "start": 1.0, "end": 1.4, "confidence": 0.9},
+    ]
+    engine._aligner = mock_aligner
+
+    mock_nemo = MagicMock()
+    mock_nemo.is_available.return_value = (True, None)
+    mock_nemo.diarize.side_effect = RuntimeError("NeMo must not be called when VAD fails!")
+    engine._nemo_diarizer = mock_nemo
+
+    # Simulate VAD inference exception
+    mock_get_vad.side_effect = RuntimeError("Silero VAD model failure")
+
+    result = engine.transcribe(dummy_audio_16k, recording_id="vad_fail_test")
+
+    mock_nemo.diarize.assert_not_called()
+    assert result.summary["diarization_status"] == "DIARIZATION_FAILED"
+    assert "Voice Activity Detection failed" in result.summary["diarization_blocker"]
+    assert "Silero VAD model failure" in result.summary["diarization_blocker"]
+    assert result.summary["speakers_detected"] == 0
+    for w in result.words:
+        assert w.speaker == "SPEAKER_UNASSIGNED"
+
+
+@patch("faster_whisper.vad.get_speech_timestamps")
+def test_empty_vad_returns_no_speech_status(mock_get_vad, dummy_audio_16k: Path):
+    """Verify that zero detected VAD speech intervals yields NO_SPEECH without fabricating speakers."""
+    engine = Phase20SpeechEngine(
+        model_size="tiny",
+        device="cpu",
+        compute_type="int8",
+        enable_diarization=True,
+    )
+
+    mock_whisper = MagicMock()
+    mock_seg = MagicMock()
+    mock_seg.start = 0.0
+    mock_seg.end = 1.0
+    mock_seg.text = "FAINT NOISE"
+    mock_seg.avg_logprob = -0.5
+    mock_whisper.transcribe.return_value = ([mock_seg], MagicMock())
+    engine._whisper_model = mock_whisper
+
+    mock_aligner = MagicMock()
+    mock_aligner.align_segment.return_value = [
+        {"word": "FAINT", "start": 0.1, "end": 0.4, "confidence": 0.5},
+        {"word": "NOISE", "start": 0.5, "end": 0.9, "confidence": 0.5},
+    ]
+    engine._aligner = mock_aligner
+
+    mock_nemo = MagicMock()
+    mock_nemo.is_available.return_value = (True, None)
+    engine._nemo_diarizer = mock_nemo
+
+    # VAD returns zero speech intervals
+    mock_get_vad.return_value = []
+
+    result = engine.transcribe(dummy_audio_16k, recording_id="empty_vad_test")
+
+    mock_nemo.diarize.assert_not_called()
+    assert result.summary["diarization_status"] == "NO_SPEECH"
+    assert "No speech intervals detected by VAD" in result.summary["diarization_blocker"]
+    assert result.summary["speakers_detected"] == 0
+    assert result.speakers == []
+    for w in result.words:
+        assert w.speaker == "SPEAKER_UNASSIGNED"
+
+
+@patch("faster_whisper.vad.get_speech_timestamps")
+def test_malformed_vad_intervals_trigger_failure(mock_get_vad, dummy_audio_16k: Path):
+    """Verify that invalid/negative VAD timestamps trigger failure rather than proceeding."""
+    engine = Phase20SpeechEngine(
+        model_size="tiny",
+        device="cpu",
+        compute_type="int8",
+        enable_diarization=True,
+    )
+
+    mock_whisper = MagicMock()
+    mock_whisper.transcribe.return_value = ([MagicMock(start=0.0, end=1.0, text="WORD", avg_logprob=-0.1)], MagicMock())
+    engine._whisper_model = mock_whisper
+
+    mock_aligner = MagicMock()
+    mock_aligner.align_segment.return_value = [{"word": "WORD", "start": 0.1, "end": 0.9, "confidence": 0.9}]
+    engine._aligner = mock_aligner
+
+    mock_nemo = MagicMock()
+    mock_nemo.is_available.return_value = (True, None)
+    engine._nemo_diarizer = mock_nemo
+
+    # Return invalid timestamps where start >= end
+    mock_get_vad.return_value = [{"start": 16000, "end": 8000}]
+
+    result = engine.transcribe(dummy_audio_16k, recording_id="malformed_vad_test")
+
+    mock_nemo.diarize.assert_not_called()
+    assert result.summary["diarization_status"] == "DIARIZATION_FAILED"
+    assert "Invalid VAD duration" in result.summary["diarization_blocker"]
+    assert result.summary["speakers_detected"] == 0
 
 
 def test_external_rttm_attribution(dummy_audio_16k: Path, tmp_path: Path):

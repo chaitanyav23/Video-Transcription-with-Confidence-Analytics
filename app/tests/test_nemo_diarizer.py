@@ -1,6 +1,16 @@
-"""Unit tests for the NeMo MSDD Diarization Adapter (app/engine/nemo_diarizer.py).
+"""Unit tests for the NeMo MSDD Diarization Adapter and Worker Protocol.
 
 Deterministic unit verification without requiring GPU, model loading, or speech inference.
+Tests:
+- Environment and checkpoint detection
+- Oracle VAD RTTM formatting (speech-only dummy 'speaker' label)
+- NIST RTTM parsing
+- Empty VAD short-circuiting (pre-worker and in-worker NO_SPEECH protocol)
+- Workspace isolation and unique child directory creation
+- Deterministic RTTM output location and workspace provenance checks
+- Strict JSON protocol validation (missing, malformed, unknown status, failed status)
+- Path traversal and security boundary rejection
+- Subprocess error capture and timeout enforcement
 """
 from __future__ import annotations
 
@@ -116,42 +126,89 @@ def test_diarize_missing_audio_or_vad(tmp_path: Path):
 
 
 @patch("subprocess.run")
+def test_diarize_empty_vad_intervals_short_circuits(mock_run, tmp_path: Path):
+    """Verify that an empty list of VAD intervals short-circuits without worker invocation."""
+    fake_audio = tmp_path / "silence.wav"
+    fake_audio.touch()
+
+    diarizer = NemoMsddDiarizer()
+    segs, status, blocker, stats = diarizer.diarize(
+        audio_path=fake_audio,
+        vad_intervals=[],
+    )
+    mock_run.assert_not_called()
+    assert status == "NO_SPEECH"
+    assert segs == []
+    assert stats["speaker_count"] == 0
+    assert "No speech intervals" in str(blocker)
+
+
+@patch("subprocess.run")
+def test_diarize_empty_vad_rttm_short_circuits(mock_run, tmp_path: Path):
+    """Verify that a VAD RTTM with zero turns short-circuits without worker invocation."""
+    fake_audio = tmp_path / "silence.wav"
+    fake_audio.touch()
+
+    empty_rttm = tmp_path / "empty_vad.rttm"
+    empty_rttm.write_text("# Only comments\n\n", encoding="utf-8")
+
+    diarizer = NemoMsddDiarizer()
+    segs, status, blocker, stats = diarizer.diarize(
+        audio_path=fake_audio,
+        vad_rttm=empty_rttm,
+    )
+    mock_run.assert_not_called()
+    assert status == "NO_SPEECH"
+    assert segs == []
+    assert stats["speaker_count"] == 0
+    assert "0 speech intervals" in str(blocker)
+
+
+@patch("subprocess.run")
 def test_diarize_subprocess_mock_success(mock_run, tmp_path: Path):
-    """Test successful diarization orchestration via subprocess mocking."""
+    """Test successful diarization orchestration with isolated workspace and valid protocol."""
     fake_audio = tmp_path / "meeting.wav"
     fake_audio.touch()
 
-    out_dir = tmp_path / "diar_out"
-    out_dir.mkdir()
+    parent_out_dir = tmp_path / "diar_parent"
+    parent_out_dir.mkdir()
 
-    # Worker output predicted.rttm
-    predicted_rttm = out_dir / "predicted.rttm"
-    predicted_rttm.write_text(
-        "SPEAKER meeting 1 0.00 2.00 <NA> <NA> speaker_0 <NA> <NA>\n"
-        "SPEAKER meeting 1 2.50 1.50 <NA> <NA> speaker_1 <NA> <NA>\n"
-    )
+    def fake_subprocess_exec(cmd, **kwargs):
+        # Determine unique child directory passed to worker
+        out_dir_idx = cmd.index("--out-dir") + 1
+        worker_work_dir = Path(cmd[out_dir_idx])
+        assert worker_work_dir.is_dir()
+        assert worker_work_dir.parent == parent_out_dir
 
-    worker_payload = {
-        "status": "success",
-        "speaker_count": 2,
-        "speakers": ["speaker_0", "speaker_1"],
-        "turn_count": 2,
-        "rttm_path": str(predicted_rttm),
-        "inference_time_seconds": 1.45,
-    }
+        # Simulate worker creating predicted.rttm
+        predicted_rttm = worker_work_dir / "predicted.rttm"
+        predicted_rttm.write_text(
+            "SPEAKER meeting 1 0.00 2.00 <NA> <NA> speaker_0 <NA> <NA>\n"
+            "SPEAKER meeting 1 2.50 1.50 <NA> <NA> speaker_1 <NA> <NA>\n"
+        )
 
-    mock_run.return_value = MagicMock(
-        returncode=0,
-        stdout=f"INFO: Log before\n{json.dumps(worker_payload)}\nINFO: Log after",
-        stderr="",
-    )
+        worker_payload = {
+            "status": "SUCCESS",
+            "speaker_count": 2,
+            "speakers": ["speaker_0", "speaker_1"],
+            "turn_count": 2,
+            "rttm_path": str(predicted_rttm.resolve()),
+            "inference_time_seconds": 1.45,
+        }
+        return MagicMock(
+            returncode=0,
+            stdout=f"INFO: Log before\n{json.dumps(worker_payload)}\nINFO: Log after",
+            stderr="",
+        )
+
+    mock_run.side_effect = fake_subprocess_exec
 
     diarizer = NemoMsddDiarizer()
     intervals = [{"start": 0.0, "end": 2.0}, {"start": 2.5, "end": 4.0}]
     segs, status, blocker, stats = diarizer.diarize(
         audio_path=fake_audio,
         vad_intervals=intervals,
-        out_dir=out_dir,
+        out_dir=parent_out_dir,
     )
 
     assert status == "DIARIZATION_AVAILABLE"
@@ -169,6 +226,176 @@ def test_diarize_subprocess_mock_success(mock_run, tmp_path: Path):
     assert str(fake_audio.resolve()) in called_cmd
     assert "--vad-rttm" in called_cmd
     assert "--out-dir" in called_cmd
+
+
+@patch("subprocess.run")
+def test_diarize_missing_json_payload(mock_run, tmp_path: Path):
+    """Test rejection when worker exits 0 but produces no structured JSON output."""
+    fake_audio = tmp_path / "audio.wav"
+    fake_audio.touch()
+
+    mock_run.return_value = MagicMock(
+        returncode=0,
+        stdout="INFO: finished with no JSON string at all\nDone.",
+        stderr="",
+    )
+
+    diarizer = NemoMsddDiarizer()
+    segs, status, blocker, stats = diarizer.diarize(
+        audio_path=fake_audio,
+        vad_intervals=[{"start": 0.0, "end": 1.0}],
+    )
+    assert status == "DIARIZATION_FAILED"
+    assert "emitted no structured JSON" in str(blocker)
+
+
+@patch("subprocess.run")
+def test_diarize_malformed_json_payload(mock_run, tmp_path: Path):
+    """Test rejection when worker emits malformed JSON."""
+    fake_audio = tmp_path / "audio.wav"
+    fake_audio.touch()
+
+    mock_run.return_value = MagicMock(
+        returncode=0,
+        stdout="{status: invalid_json_here}\n",
+        stderr="",
+    )
+
+    diarizer = NemoMsddDiarizer()
+    segs, status, blocker, stats = diarizer.diarize(
+        audio_path=fake_audio,
+        vad_intervals=[{"start": 0.0, "end": 1.0}],
+    )
+    assert status == "DIARIZATION_FAILED"
+    assert "malformed JSON" in str(blocker)
+
+
+@patch("subprocess.run")
+def test_diarize_unrecognized_worker_status(mock_run, tmp_path: Path):
+    """Test rejection of non-protocol status strings."""
+    fake_audio = tmp_path / "audio.wav"
+    fake_audio.touch()
+
+    mock_run.return_value = MagicMock(
+        returncode=0,
+        stdout=json.dumps({"status": "MAYBE_DONE", "turns": 2}),
+        stderr="",
+    )
+
+    diarizer = NemoMsddDiarizer()
+    segs, status, blocker, stats = diarizer.diarize(
+        audio_path=fake_audio,
+        vad_intervals=[{"start": 0.0, "end": 1.0}],
+    )
+    assert status == "DIARIZATION_FAILED"
+    assert "Unrecognized worker status: 'MAYBE_DONE'" in str(blocker)
+
+
+@patch("subprocess.run")
+def test_diarize_worker_reported_failure_status(mock_run, tmp_path: Path):
+    """Test handling of explicit worker FAILED status despite 0 returncode."""
+    fake_audio = tmp_path / "audio.wav"
+    fake_audio.touch()
+
+    mock_run.return_value = MagicMock(
+        returncode=0,
+        stdout=json.dumps({"status": "FAILED", "error": "Internal clustering convergence failure"}),
+        stderr="",
+    )
+
+    diarizer = NemoMsddDiarizer()
+    segs, status, blocker, stats = diarizer.diarize(
+        audio_path=fake_audio,
+        vad_intervals=[{"start": 0.0, "end": 1.0}],
+    )
+    assert status == "DIARIZATION_FAILED"
+    assert "Internal clustering convergence failure" in str(blocker)
+
+
+@patch("subprocess.run")
+def test_diarize_worker_reported_no_speech_status(mock_run, tmp_path: Path):
+    """Test handling of explicit worker NO_SPEECH status."""
+    fake_audio = tmp_path / "audio.wav"
+    fake_audio.touch()
+
+    mock_run.return_value = MagicMock(
+        returncode=0,
+        stdout=json.dumps({
+            "status": "NO_SPEECH",
+            "reason": "VAD RTTM contains 0 speech intervals.",
+            "speaker_count": 0,
+            "speakers": [],
+            "turn_count": 0,
+            "total_speech_seconds": 0.0,
+        }),
+        stderr="",
+    )
+
+    diarizer = NemoMsddDiarizer()
+    # Pass dummy vad_rttm with a turn so adapter invokes worker
+    dummy_vad = tmp_path / "dummy_vad.rttm"
+    dummy_vad.write_text("SPEAKER audio 1 0.0 1.0 <NA> <NA> speaker <NA> <NA>\n")
+
+    segs, status, blocker, stats = diarizer.diarize(
+        audio_path=fake_audio,
+        vad_rttm=dummy_vad,
+    )
+    assert status == "NO_SPEECH"
+    assert segs == []
+    assert stats["speaker_count"] == 0
+    assert "0 speech intervals" in str(blocker)
+
+
+@patch("subprocess.run")
+def test_diarize_worker_provenance_violation(mock_run, tmp_path: Path):
+    """Test security boundary: worker returning RTTM outside the unique workspace is rejected."""
+    fake_audio = tmp_path / "audio.wav"
+    fake_audio.touch()
+
+    external_rttm = tmp_path / "outside_workspace.rttm"
+    external_rttm.write_text("SPEAKER audio 1 0.0 1.0 <NA> <NA> speaker_0 <NA> <NA>\n")
+
+    mock_run.return_value = MagicMock(
+        returncode=0,
+        stdout=json.dumps({"status": "SUCCESS", "rttm_path": str(external_rttm.resolve())}),
+        stderr="",
+    )
+
+    diarizer = NemoMsddDiarizer()
+    segs, status, blocker, stats = diarizer.diarize(
+        audio_path=fake_audio,
+        vad_intervals=[{"start": 0.0, "end": 1.0}],
+    )
+    assert status == "DIARIZATION_FAILED"
+    assert "outside invocation workspace" in str(blocker)
+
+
+@patch("subprocess.run")
+def test_diarize_worker_missing_output_file(mock_run, tmp_path: Path):
+    """Test rejection when worker reports SUCCESS but referenced RTTM does not exist on disk."""
+    fake_audio = tmp_path / "audio.wav"
+    fake_audio.touch()
+
+    def fake_subprocess_exec(cmd, **kwargs):
+        out_dir_idx = cmd.index("--out-dir") + 1
+        worker_work_dir = Path(cmd[out_dir_idx])
+        # Return path inside workspace, but do NOT create the file
+        nonexistent = worker_work_dir / "predicted.rttm"
+        return MagicMock(
+            returncode=0,
+            stdout=json.dumps({"status": "SUCCESS", "rttm_path": str(nonexistent.resolve())}),
+            stderr="",
+        )
+
+    mock_run.side_effect = fake_subprocess_exec
+
+    diarizer = NemoMsddDiarizer()
+    segs, status, blocker, stats = diarizer.diarize(
+        audio_path=fake_audio,
+        vad_intervals=[{"start": 0.0, "end": 1.0}],
+    )
+    assert status == "DIARIZATION_FAILED"
+    assert "does not exist as a regular file" in str(blocker)
 
 
 @patch("subprocess.run")
