@@ -8,6 +8,9 @@ from pydantic import BaseModel, Field
 class ConfidenceFeatures(BaseModel):
     """Raw acoustic and model features utilized for confidence calibration."""
     acoustic_score: float = Field(..., description="Acoustic or token log-probability / likelihood")
+    alignment_score: Optional[float] = Field(default=None, description="Wav2Vec2 CTC acoustic alignment score in [0.0, 1.0]")
+    asr_confidence: Optional[float] = Field(default=None, description="Faster-Whisper sequence likelihood probability in [0.0, 1.0]")
+    alignment_status: str = Field(default="aligned", description="aligned | unaligned | fallback")
     duration: float = Field(..., description="Word acoustic duration in seconds")
     speech_ratio: float = Field(1.0, description="Ratio of word duration to parent VAD chunk duration")
     overlap_detected: bool = Field(False, description="Flag indicating presence of overlapping speaker energy")
@@ -23,6 +26,9 @@ class AlignedWord(BaseModel):
     confidence: float = Field(..., ge=0.0, le=1.0, description="Calibrated confidence score in [0.0, 1.0]")
     raw_confidence: float = Field(..., ge=0.0, le=1.0, description="Raw uncalibrated confidence score")
     is_calibrated: bool = Field(default=True, description="Whether calibration mapping was applied")
+    alignment_status: str = Field(default="aligned", description="aligned | unaligned | fallback")
+    alignment_score: Optional[float] = Field(default=None, description="Raw Wav2Vec2 CTC alignment score in [0.0, 1.0]")
+    asr_confidence: Optional[float] = Field(default=None, description="Faster-Whisper sequence likelihood probability in [0.0, 1.0]")
     features: Optional[ConfidenceFeatures] = Field(default=None, description="Acoustic and model features")
 
 

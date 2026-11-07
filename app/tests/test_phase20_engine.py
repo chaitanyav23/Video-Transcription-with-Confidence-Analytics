@@ -1,6 +1,7 @@
 """Unit and integration tests for Phase20SpeechEngine."""
 from __future__ import annotations
 
+import pytest
 from pathlib import Path
 from engine.phase20_engine import Phase20SpeechEngine
 from engine.schemas import AlignedWord, ConfidenceFeatures, TranscriptResult
@@ -62,7 +63,7 @@ def test_phase20_real_audio_inference():
     ]
     test_audio = next((p for p in audio_candidates if p.exists()), None)
     if not test_audio:
-        return
+        pytest.skip("Benchmark audio fixture is absent; skipping real audio inference test.")
 
     engine = Phase20SpeechEngine(model_size="tiny")
     progress = []

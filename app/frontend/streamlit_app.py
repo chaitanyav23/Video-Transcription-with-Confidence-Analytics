@@ -232,6 +232,10 @@ c3.metric("Avg Confidence", f"{mean_conf:.1%}")
 c4.metric("Low-Confidence Words", f"{n_low} ({n_low / max(1, n_words):.0%})")
 c5.metric("Speakers Detected", speakers_count)
 
+summary_data = transcript_res.get("summary", {})
+if summary_data.get("diarization_blocker"):
+    st.info(f"ℹ️ **Diarization Notice:** {summary_data['diarization_blocker']} (Status: `{summary_data.get('diarization_status')}`)")
+
 # Audio playback player
 stream_url = client.get_stream_url(current_recording_id)
 st.subheader("🎧 Media Audio Playback")

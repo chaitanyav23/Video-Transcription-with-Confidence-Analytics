@@ -94,6 +94,20 @@ class Phase20SpeechEngine(BaseSpeechEngine):
             self.compute_type = compute_type
 
         self._whisper_model = None
+        self._aligner = None
+
+    def _get_aligner(self):
+        """Lazy load native Wav2Vec2 CTC forced aligner."""
+        if self._aligner is None:
+            try:
+                from engine.wav2vec2_aligner import Wav2Vec2ForcedAligner
+            except ImportError:
+                from app.engine.wav2vec2_aligner import Wav2Vec2ForcedAligner
+
+            logger.info("Loading native Wav2Vec2 CTC aligner on %s...", self.device)
+            self._aligner = Wav2Vec2ForcedAligner(device=self.device, lazy_load=True)
+            self._aligner.load_model()
+        return self._aligner
 
     def _get_whisper_model(self):
         """Lazy load Faster-Whisper model."""
@@ -295,6 +309,20 @@ class Phase20SpeechEngine(BaseSpeechEngine):
         duration = self.get_audio_duration(audio_path)
         model = self._get_whisper_model()
 
+        # Read preprocessed waveform for Wav2Vec2 forced alignment
+        try:
+            import soundfile as sf
+            waveform, sr = sf.read(str(audio_path), dtype="float32")
+            if waveform.ndim > 1:
+                waveform = waveform.mean(axis=1)
+        except Exception as exc:
+            logger.warning("Failed to load audio with soundfile (%s). Alignment will be marked unaligned.", exc)
+            waveform = None
+            sr = 16000
+
+        enable_alignment = kwargs.get("enable_alignment", True)
+        aligner = self._get_aligner() if enable_alignment else None
+
         # Phase 20 specification: condition_on_previous_text=False prevents hallucination cascades
         logger.info(
             "Transcribing %s (duration: %.2fs) with condition_on_previous_text=False...",
@@ -307,7 +335,7 @@ class Phase20SpeechEngine(BaseSpeechEngine):
             language=language,
             task="transcribe",
             beam_size=5,
-            word_timestamps=True,
+            word_timestamps=False,
             condition_on_previous_text=False,
             initial_prompt=initial_prompt,
             vad_filter=True,
@@ -325,32 +353,80 @@ class Phase20SpeechEngine(BaseSpeechEngine):
             if not seg_text:
                 continue
 
-            seg_words = []
-            if seg.words:
-                for w in seg.words:
-                    word_clean = w.word.strip()
-                    if not word_clean:
-                        continue
-                    # w.probability is [0, 1] derived from token logprobs
-                    raw_p = float(w.probability) if w.probability is not None else 0.85
-                    raw_p = max(0.001, min(0.999, raw_p))
-                    raw_words.append({
-                        "word": word_clean,
-                        "start": round(float(w.start), 3),
-                        "end": round(float(w.end), 3),
-                        "confidence": raw_p,
-                    })
-                    seg_words.append(word_clean)
+            seg_start = round(float(seg.start), 3)
+            seg_end = round(float(seg.end), 3)
+            seg_dur = max(0.0, seg_end - seg_start)
+
+            # Faster-Whisper sequence likelihood probability derived from average token logprobs
+            avg_lp = float(seg.avg_logprob) if hasattr(seg, "avg_logprob") else -0.5
+            asr_prob = max(0.001, min(0.999, math.exp(avg_lp)))
 
             raw_segments.append({
-                "start": round(float(seg.start), 3),
-                "end": round(float(seg.end), 3),
+                "start": seg_start,
+                "end": seg_end,
                 "text": seg_text,
-                "avg_logprob": float(seg.avg_logprob) if hasattr(seg, "avg_logprob") else -0.5,
+                "avg_logprob": avg_lp,
             })
 
-        # Load diarization segments if RTTM is provided or derive from VAD segments
-        diar_segments = self._load_or_derive_diarization(audio_path, diarization_rttm, raw_segments)
+            # Check zero-duration edge case (as documented in B.3): cannot align zero-duration interval
+            if seg_dur <= 0.001:
+                tokens_in_text = [w for w in seg_text.split() if w]
+                for token in tokens_in_text:
+                    raw_words.append({
+                        "word": token,
+                        "start": seg_start,
+                        "end": seg_end,
+                        "confidence": 0.0,
+                        "alignment_score": None,
+                        "asr_confidence": round(asr_prob, 4),
+                        "alignment_status": "fallback",
+                    })
+                continue
+
+            # Execute native Wav2Vec2 CTC forced alignment
+            aligned_chunk_words = None
+            if aligner is not None and waveform is not None:
+                f1 = max(0, int(seg_start * sr))
+                f2 = min(len(waveform), int(seg_end * sr))
+                chunk = waveform[f1:f2]
+                try:
+                    aligned_chunk_words = aligner.align_segment(chunk, seg_text, seg_start, seg_end)
+                except Exception as exc:
+                    logger.warning("Alignment failed on [%.3f, %.3f] ('%s'): %s", seg_start, seg_end, seg_text, exc)
+                    aligned_chunk_words = None
+
+            if aligned_chunk_words:
+                for w in aligned_chunk_words:
+                    ctc_score = float(w["confidence"])
+                    is_fallback = (ctc_score == 0.0 and w["start"] == seg_start and w["end"] == seg_end)
+                    status = "fallback" if is_fallback else "aligned"
+                    raw_words.append({
+                        "word": w["word"],
+                        "start": w["start"],
+                        "end": w["end"],
+                        "confidence": ctc_score if not is_fallback else 0.0,
+                        "alignment_score": round(ctc_score, 4) if not is_fallback else None,
+                        "asr_confidence": round(asr_prob, 4),
+                        "alignment_status": status,
+                    })
+            else:
+                # If alignment failed or was disabled, retain text with segment bounds as unaligned
+                tokens_in_text = [w for w in seg_text.split() if w]
+                for token in tokens_in_text:
+                    raw_words.append({
+                        "word": token,
+                        "start": seg_start,
+                        "end": seg_end,
+                        "confidence": 0.0,
+                        "alignment_score": None,
+                        "asr_confidence": round(asr_prob, 4),
+                        "alignment_status": "unaligned",
+                    })
+
+        # Load diarization segments if RTTM is provided or expose explicit blocker
+        diar_segments, diar_status, diar_blocker = self._load_or_derive_diarization(
+            audio_path, diarization_rttm, raw_segments, duration
+        )
 
         # Step 4: Word-Level Speaker Attribution Fusion
         attributed = self._attribute_words(raw_words, diar_segments)
@@ -359,11 +435,15 @@ class Phase20SpeechEngine(BaseSpeechEngine):
         aligned_words: List[AlignedWord] = []
         for w_dict in attributed:
             raw_c = float(w_dict["confidence"])
-            cal_c = float(self.calibrator.calibrate(raw_c))
-            w_dur = max(0.01, round(w_dict["end"] - w_dict["start"], 3))
+            status = w_dict.get("alignment_status", "aligned")
+            cal_c = float(self.calibrator.calibrate(raw_c)) if status == "aligned" else 0.0
+            w_dur = max(0.0, round(w_dict["end"] - w_dict["start"], 3))
 
             features = ConfidenceFeatures(
-                acoustic_score=round(raw_c, 4),
+                acoustic_score=round(w_dict.get("asr_confidence") or raw_c, 4),
+                alignment_score=w_dict.get("alignment_score"),
+                asr_confidence=w_dict.get("asr_confidence"),
+                alignment_status=status,
                 duration=w_dur,
                 speech_ratio=1.0,
                 overlap_detected=False,
@@ -379,6 +459,9 @@ class Phase20SpeechEngine(BaseSpeechEngine):
                     confidence=round(cal_c, 4),
                     raw_confidence=round(raw_c, 4),
                     is_calibrated=True,
+                    alignment_status=status,
+                    alignment_score=w_dict.get("alignment_score"),
+                    asr_confidence=w_dict.get("asr_confidence"),
                     features=features,
                 )
             )
@@ -405,10 +488,17 @@ class Phase20SpeechEngine(BaseSpeechEngine):
             "overall_confidence": overall_conf,
             "mean_confidence": overall_conf,
             "word_count": len(aligned_words),
+            "aligned_word_count": sum(1 for w in aligned_words if w.alignment_status == "aligned"),
+            "fallback_word_count": sum(1 for w in aligned_words if w.alignment_status == "fallback"),
+            "unaligned_word_count": sum(1 for w in aligned_words if w.alignment_status == "unaligned"),
             "turn_count": len(turns),
             "speakers_detected": len(speakers),
             "low_confidence_word_count": low_conf_count,
             "speaker_distribution": speaker_dist,
+            "alignment_model": "wav2vec2_fairseq_base_ls960_asr_ls960.pth",
+            "alignment_method": "Native-Wav2Vec2-CTC",
+            "diarization_status": diar_status,
+            "diarization_blocker": diar_blocker,
         }
 
         cal_meta = CalibrationMetadata(
@@ -425,7 +515,7 @@ class Phase20SpeechEngine(BaseSpeechEngine):
             duration=round(duration, 2),
             sample_rate=16000,
             channels=1,
-            method="Phase20-FasterWhisper-MidpointFusion",
+            method="Phase20-FasterWhisper-NativeWav2Vec2",
             calibration=cal_meta,
             speakers=speakers,
             segments=turns,
@@ -438,12 +528,13 @@ class Phase20SpeechEngine(BaseSpeechEngine):
         audio_path: Path,
         diarization_rttm: Optional[Path],
         raw_segments: List[Dict[str, Any]],
-    ) -> List[Dict[str, Any]]:
+        duration: float,
+    ) -> Tuple[List[Dict[str, Any]], str, Optional[str]]:
         """
-        Load speaker intervals from RTTM if available, or derive turns using Pyannote/Silero.
+        Load speaker intervals from RTTM if available, or expose explicit blocker.
         """
         if diarization_rttm and diarization_rttm.exists():
-            return self._parse_rttm(diarization_rttm)
+            return (self._parse_rttm(diarization_rttm), "EXTERNAL_RTTM", None)
 
         # Check if pyannote-audio is available with token
         if self.hf_token:
@@ -467,26 +558,20 @@ class Phase20SpeechEngine(BaseSpeechEngine):
                         "speaker": speaker,
                     })
                 if segments:
-                    return segments
+                    return (segments, "PYANNOTE_COMMUNITY_DIARIZATION", None)
             except Exception as exc:
-                logger.warning("Pyannote diarization failed or unauthenticated (%s). Using turn clustering.", exc)
+                logger.warning("Pyannote diarization failed or unauthenticated (%s).", exc)
 
-        # Fallback: Partition turns by segment pause dynamics (>1.5s pause indicates speaker shift)
-        segments = []
-        current_speaker_idx = 0
-        last_end = 0.0
-        for seg in raw_segments:
-            gap = seg["start"] - last_end
-            if gap > 1.5 and segments:
-                current_speaker_idx = (current_speaker_idx + 1) % 2
-            segments.append({
-                "start": seg["start"],
-                "end": seg["end"],
-                "speaker": f"SPEAKER_{current_speaker_idx:02d}",
-            })
-            last_end = seg["end"]
-
-        return segments
+        # Diarization is unavailable: do NOT fabricate speaker labels.
+        # Mark speaker as SPEAKER_UNASSIGNED across the audio duration.
+        segments = [{
+            "start": 0.0,
+            "end": round(duration, 3),
+            "speaker": "SPEAKER_UNASSIGNED",
+        }]
+        diar_status = "UNAVAILABLE_PENDING_MSDD"
+        diar_blocker = "NVIDIA NeMo MSDD / TitaNet diarization is not installed in the environment."
+        return (segments, diar_status, diar_blocker)
 
     def _parse_rttm(self, rttm_path: Path) -> List[Dict[str, Any]]:
         """Parse standard NIST RTTM file into list of segment dicts."""
@@ -533,22 +618,20 @@ class Phase20SpeechEngine(BaseSpeechEngine):
                 # 2. Check nearest neighbor distance to word midpoint
                 midpoint = (w_start + w_end) / 2.0
                 best_dist = float("inf")
-                nearest = "SPEAKER_00"
+                nearest = "SPEAKER_UNASSIGNED"
                 for seg in diar_segments:
                     dist = min(abs(midpoint - seg["start"]), abs(midpoint - seg["end"]))
                     if dist < best_dist:
                         best_dist = dist
                         nearest = seg["speaker"]
 
-                best_speaker = nearest if best_dist <= tolerance else "SPEAKER_00"
+                best_speaker = nearest if best_dist <= tolerance else "SPEAKER_UNASSIGNED"
 
-            output.append({
-                "word": word["word"],
-                "start": w_start,
-                "end": w_end,
-                "confidence": word["confidence"],
-                "speaker": best_speaker,
-            })
+            w_out = dict(word)
+            w_out["start"] = w_start
+            w_out["end"] = w_end
+            w_out["speaker"] = best_speaker
+            output.append(w_out)
         return output
 
     def _group_into_turns(
