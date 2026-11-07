@@ -1,0 +1,396 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=0.85in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{amsmath}
+\usepackage{array}
+\usepackage{titlesec}
+
+\definecolor{IITKBlue}{HTML}{17365D}
+\definecolor{Muted}{HTML}{555555}
+\hypersetup{
+  colorlinks=true,
+  linkcolor=IITKBlue,
+  urlcolor=IITKBlue,
+  citecolor=IITKBlue,
+  pdftitle={Video Transcription with Confidence Analytics},
+  pdfsubject={CS698B Fundamentals of Data Engineering-I Final Project Proposal}
+}
+\titleformat{\section}{\Large\bfseries\color{IITKBlue}}{\thesection.}{0.55em}{}
+\titleformat{\subsection}{\large\bfseries\color{IITKBlue}}{\thesubsection}{0.55em}{}
+\setlist[itemize]{leftmargin=1.4em,itemsep=2pt,topsep=3pt}
+\setlist[enumerate]{leftmargin=1.6em,itemsep=2pt,topsep=3pt}
+\renewcommand{\arraystretch}{1.18}
+
+\title{\vspace{-1.1cm}\textbf{\Huge Video Transcription with Confidence Analytics}\\[0.35em]
+\large CS698B -- Fundamentals of Data Engineering-I\\
+\normalsize Final Project Proposal}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+\vspace{-1.2em}
+
+\begin{abstract}
+We propose a web application that converts uploaded, pre-recorded videos into
+speaker-attributed, time-aligned transcripts and communicates how reliable
+different parts of the generated transcript are. In addition to transcription,
+the system estimates word- and segment-level confidence, evaluates those
+estimates against reference transcripts on a benchmark collection, and
+visualizes uncertain regions so that users can prioritize manual review.
+The project combines an audio ETL pipeline, pretrained speech models,
+confidence estimation and calibration, an interactive visualization
+dashboard, persistent application services, and reproducible software
+engineering practices.
+\end{abstract}
+
+\section{Introduction and Motivation}
+
+Conventional speech-to-text systems primarily return a transcript. A transcript
+alone, however, does not tell a user which words are likely to be correct,
+which regions are affected by noise or overlapping speech, or where manual
+verification is most important. This limitation is particularly relevant to
+recordings containing multiple speakers, variable acoustic conditions, and
+domain-specific vocabulary.
+
+Our project, \textbf{Video Transcription with Confidence Analytics}, addresses
+this problem through a web application for pre-recorded video and audio.
+The application extracts the audio, processes it through a speech-intelligence
+pipeline, and returns a time-aligned transcript with speaker attribution and
+confidence information. The dashboard highlights uncertain words and
+segments, provides audio-linked inspection, and summarizes the overall
+transcription quality.
+
+The project uses publicly available recordings with manually prepared
+reference transcripts for development and quantitative evaluation. These
+references are available for the benchmark collection, not for arbitrary
+user uploads. Therefore, uploaded recordings are transcribed without assuming
+that a reference transcript exists. Confidence estimation for user uploads
+uses signals available from the model and audio; its calibration and measured
+reliability are assessed separately on the labelled benchmark data.
+
+The scope is limited to \textbf{pre-recorded media}. Live transcription is
+not part of the current project.
+
+\section{Objectives}
+
+The main objectives are:
+\begin{enumerate}
+  \item Build a reproducible ETL pipeline that converts uploaded media into
+  validated, standardized audio and structured transcript records.
+  \item Generate accurate word-level transcripts, timestamps, and speaker
+  attribution using pretrained speech models.
+  \item Estimate confidence at word and segment level, and study whether
+  these confidence values correspond to observed transcription correctness.
+  \item Evaluate transcription and confidence quality using reference data and
+  appropriate metrics.
+  \item Develop an accessible dashboard for exploring transcripts, audio
+  timelines, speakers, confidence trends, and evaluation results.
+  \item Deliver the system as a usable application with persistent records,
+  documented interfaces, automated tests, and reproducible configuration.
+\end{enumerate}
+
+\section{Project Components}
+
+\subsection{Data Component -- ETLS}
+
+The data component manages media ingestion, transformation, validation,
+structured storage, and reproducibility.
+
+\paragraph{Ingestion.}
+Users upload a pre-recorded video or audio file. The system validates the
+file type and media stream, extracts the audio track from video, and records
+metadata such as filename, duration, sample rate, channel count, and file
+hash. Supported input formats are intended to include common formats such as
+MP4, MOV, MP3, WAV, M4A, and FLAC, subject to the installed media decoder.
+
+\paragraph{Transformation.}
+The audio is converted to a consistent representation (16\,kHz, mono PCM WAV)
+for downstream processing. The pipeline performs audio validation and
+loudness normalization. Voice Activity Detection (VAD) identifies speech
+regions and supports segmentation of long recordings. The system retains
+timestamps so that transcript words and speaker turns can be mapped back to
+the original media timeline. Noise reduction may be evaluated as an optional
+preprocessing experiment; it is not assumed to improve recognition in every
+recording condition.
+
+\paragraph{Loading and storage.}
+The application stores recording metadata, processing-job status, word-level
+transcription results, speaker turns, confidence values, and user revisions
+in a structured database. SQLite is suitable for local development, with
+PostgreSQL as an alternative for multi-user deployment. Intermediate
+tabular evaluation data may be stored in Parquet or CSV. Original uploads
+and generated media artifacts are stored separately from relational metadata.
+
+
+\subsection{Adaptive / AI--ML Component}
+
+This component performs speech recognition, speaker analysis, and
+confidence estimation. It uses pretrained models rather than training a
+large speech model from scratch.
+
+\paragraph{Speech processing pipeline.}
+The proposed processing sequence is:
+\begin{enumerate}
+  \item \textbf{Audio preprocessing:} standardize the audio format and
+  loudness while retaining the original timeline.
+  \item \textbf{Voice Activity Detection:} use a high-recall VAD model to
+  identify speech regions and split long regions into manageable chunks.
+  \item \textbf{Automatic Speech Recognition:} use Faster-Whisper
+  (Large-v3, subject to available hardware) to produce the transcript.
+  \item \textbf{Forced alignment:} use a Wav2Vec2-based aligner through
+  WhisperX to estimate word-level start and end times.
+  \item \textbf{Speaker diarization:} use NeMo MSDD with TitaNet speaker
+  representations, conditioned on speech regions, to estimate who spoke
+  when.
+  \item \textbf{Speaker--word fusion:} associate each aligned word with the
+  diarization timeline using temporal overlap and a word-midpoint rule.
+  Consecutive words assigned to the same speaker are grouped into turns.
+\end{enumerate}
+
+The pipeline is modular: individual stages can be evaluated and replaced
+without changing the data model or visualization layer. The selected models
+are pretrained; the project focuses on integration, evaluation, confidence
+modelling, and application-level intelligence.
+
+\paragraph{Confidence estimation.}
+A model's raw decoding score is not automatically a calibrated probability
+that a word is correct. We will therefore distinguish between:
+\begin{itemize}
+  \item \textbf{Raw confidence features:} available token/word likelihood
+  information and model scores, where exposed by the ASR implementation;
+  audio-quality indicators; speech-region characteristics; and indicators
+  of difficult conditions such as overlap or unusually short utterances.
+  \item \textbf{Calibrated confidence:} a score mapped to the empirical
+  probability of correctness using labelled benchmark examples.
+\end{itemize}
+
+Word correctness will be derived by aligning the system hypothesis with the
+reference transcript. A calibration model will be fitted using benchmark
+predictions and evaluated on held-out recordings or recording-level
+cross-validation. The project will investigate a suitable calibration method,
+such as temperature scaling or isotonic regression, depending on the
+available sample size and score distribution. Calibration must be evaluated
+on data not used to fit the calibration mapping.
+
+Confidence will be aggregated to segment level using a documented rule,
+such as the mean or a robust summary of the constituent word scores. The
+dashboard will label these values as estimates and will not present an
+uncalibrated model score as a guaranteed probability of correctness.
+
+\paragraph{Adaptive feedback.}
+Users may correct words, speaker labels, or turn boundaries. The application
+records the original model output and each subsequent revision. Corrections
+can be analysed to identify recurring lexical errors and domain-specific
+terms. Where supported by the ASR model, verified vocabulary can be supplied
+as a contextual prompt in later runs. The feedback mechanism is initially
+human-in-the-loop: corrections are collected and analysed; automatic model
+retraining is not assumed.
+
+\subsection{Visualization Component -- VIZ}
+
+The visualization component makes the transcript and its reliability
+interpretable and actionable.
+
+\begin{itemize}
+  \item \textbf{Transcript view:} display the transcript by speaker and
+  time range, with word-level confidence markers.
+  \item \textbf{Confidence highlighting:} distinguish low-, medium-, and
+  high-confidence words using colour together with symbols, labels, or
+  underline patterns. Colour is never the only indicator.
+  \item \textbf{Audio timeline:} display the waveform or speech timeline,
+  speaker-turn regions, and confidence information against media time.
+  \item \textbf{Synchronized playback:} allow a user to select a word or
+  segment, play the corresponding audio region, and follow the active word
+  during playback.
+  \item \textbf{Summary analytics:} report recording duration, word count,
+  number of detected speakers, average confidence, and the number and
+  proportion of low-confidence words.
+  \item \textbf{Evaluation analytics:} show WER and calibration results,
+  including reliability diagrams, confidence distributions, and breakdowns
+  by recording or acoustic condition where the available labels support them.
+  \item \textbf{Review and export:} allow users to inspect uncertain regions,
+  make corrections, and export transcript data and subtitles.
+\end{itemize}
+
+The dashboard will use a high-contrast, colour-vision-accessible palette,
+adjustable text size, logical headings, keyboard-operable controls, and
+tabular or plain-text alternatives to charts. The initial Streamlit
+visualization prototype supplied by the team provides a useful starting
+point for confidence tiers, accessible transcript rendering, summary
+statistics, Altair charts, and downloadable tables. It will be integrated
+selectively after its input schema is aligned with the application's
+canonical transcript format. Audio playback, waveform interaction, and
+direct pipeline integration are additional features to be developed.
+
+\subsection{Application Component -- APP}
+
+The application provides the user-facing workflow for processing and
+reviewing recordings.
+
+\begin{enumerate}
+  \item \textbf{Upload:} select and upload a pre-recorded video or audio file.
+  \item \textbf{Processing:} initiate analysis and view job status and
+  stage-level progress.
+  \item \textbf{Results:} open the generated transcript, speaker timeline,
+  and confidence dashboard.
+  \item \textbf{Review:} play selected regions, correct words, and revise
+  speaker attribution where necessary.
+  \item \textbf{Export:} download transcript results in structured JSON,
+  plain text, and subtitle formats such as SRT or VTT.
+  \item \textbf{History:} revisit previous recordings and their processing
+  results.
+\end{enumerate}
+
+The proposed implementation uses Streamlit for the initial integrated
+web interface, with Python services for media processing and persistence.
+The interface and processing pipeline will communicate through clearly
+defined functions and structured data schemas. If the final implementation
+requires a separate API service, the same processing and data interfaces
+can be exposed through REST endpoints. The application is intended for
+single-user or small-team course-project deployment; a distributed
+production-scale service is not a project requirement.
+
+\subsection{Development Component -- DEV}
+
+The development component ensures that the project is maintainable,
+testable, and reproducible.
+
+\begin{itemize}
+  \item \textbf{Version control:} Git and GitHub with feature branches,
+  meaningful commits, and code review among team members.
+  \item \textbf{Modular design:} separate ingestion, preprocessing, VAD,
+  ASR, alignment, diarization, fusion, confidence estimation, storage,
+  and visualization modules.
+  \item \textbf{Testing:} unit tests for data validation, timestamp
+  handling, confidence calculations, transcript serialization, and
+  evaluation metrics; integration tests for the end-to-end workflow.
+  \item \textbf{Reproducible environment:} pinned or bounded Python
+  dependencies, documented model versions, configuration files, and
+  setup instructions. Docker may be used to simplify deployment.
+  \item \textbf{Continuous integration:} GitHub Actions to run linting,
+  static checks, and CPU-compatible tests on each relevant change.
+  \item \textbf{Experiment tracking:} record model identifiers,
+  configuration, dataset version, run time, and evaluation metrics.
+  MLflow or a lightweight structured run log may be used.
+  \item \textbf{Data and model versioning:} use versioned manifests and
+  checksums for benchmark data and model configurations. DVC may be
+  considered if dataset size and collaboration needs justify it.
+  \item \textbf{Logging:} record stage status, duration, warnings, and
+  failures without exposing uploaded audio or credentials in logs.
+\end{itemize}
+
+\section{Evaluation Plan}
+
+Evaluation is divided into transcription quality, diarization quality,
+confidence calibration, and application performance.
+
+\subsection{Transcription and speaker metrics}
+
+\begin{itemize}
+  \item \textbf{Word Error Rate (WER):} measures substitutions,
+  deletions, and insertions in the recognized transcript.
+  \item \textbf{Character Error Rate (CER):} provides a complementary
+  character-level measure where useful.
+  \item \textbf{Diarization Error Rate (DER):} evaluates speaker
+  segmentation and attribution when compatible reference RTTM annotations
+  are available.
+  \item \textbf{Speaker-attributed metrics:} cpWER and SA-WER assess
+  transcription quality while accounting for speaker assignments.
+\end{itemize}
+
+\subsection{Confidence calibration}
+
+Confidence quality will be evaluated by comparing predicted confidence
+against observed word correctness. Planned measures include:
+\begin{itemize}
+  \item \textbf{Brier score:} mean squared error between predicted
+  correctness probability and the binary correctness outcome.
+  \item \textbf{Expected Calibration Error (ECE):} compares average
+  confidence and empirical accuracy across confidence bins.
+  \item \textbf{Reliability diagram:} plots empirical accuracy against
+  predicted confidence.
+  \item \textbf{Risk--coverage analysis:} measures error among the words
+  retained when progressively excluding the least confident predictions.
+\end{itemize}
+
+All calibration results will state the evaluation split and number of
+recordings/words used. Since the current labelled collection is small,
+recording-level separation or cross-validation will be used to reduce
+leakage, and calibration results will be interpreted with this limitation
+in mind.
+
+\subsection{System evaluation}
+
+We will also measure processing time per minute of media, stage-wise
+latency, memory/GPU usage where available, successful processing rate,
+and the usability of the review and export workflow. Baselines will include
+the ASR system without the proposed confidence calibration and, where
+feasible, alternative model configurations.
+
+\section{Expected Deliverables}
+
+The expected course-project deliverables are:
+\begin{enumerate}
+  \item A working web application for uploading and processing pre-recorded
+  video/audio.
+  \item A modular speech-processing pipeline producing word-level
+  timestamps and speaker-attributed transcripts.
+  \item Word- and segment-level confidence estimates with a documented
+  calibration and evaluation procedure.
+  \item An interactive, accessible dashboard with transcript, confidence,
+  speaker, timeline, and evaluation views.
+  \item Persistent recording and result metadata, transcript correction
+  history, and JSON/TXT/SRT/VTT exports.
+  \item A benchmark report covering WER, available diarization metrics,
+  calibration measures, and processing performance.
+  \item Source code, tests, environment/setup documentation, and a
+  demonstration video.
+\end{enumerate}
+
+\section{Scope, Assumptions, and Limitations}
+
+\begin{itemize}
+  \item The project processes pre-recorded media; real-time streaming is
+  excluded.
+  \item Pretrained models are integrated and evaluated; training a large
+  ASR or diarization model from scratch is outside the scope.
+  \item Reference transcripts are available only for the benchmark
+  recordings. Arbitrary uploads will not have ground-truth-based accuracy
+  measurements.
+  \item Calibrated confidence is meaningful only to the extent supported
+  by labelled validation data and a leakage-free evaluation procedure.
+  \item Word-level alignment and speaker metrics depend on the quality
+  and format of reference annotations. At present, structured JSON and
+  RTTM references are available for only two benchmark recordings.
+  \item Performance depends on hardware, model availability, and
+  authentication requirements for gated pretrained models.
+  \item Uploaded recordings may contain sensitive information. The
+  application will document data handling, avoid logging media contents,
+  and provide a clear retention policy for stored uploads.
+  \item Accent, language, recording-device, and acoustic-condition
+  differences may affect recognition and confidence reliability; these
+  limitations will be discussed in the final evaluation.
+\end{itemize}
+
+\section{Conclusion}
+
+Video Transcription with Confidence Analytics combines a practical
+speech-intelligence application with the data-engineering and machine-learning
+workflows required by CS698B. Its central contribution is not merely to
+generate a transcript, but to expose where the transcript is uncertain,
+measure whether confidence estimates are reliable, and help users review
+the parts that need attention. The project brings together ETLS, pretrained
+speech models, confidence calibration, accessible visualization, application
+development, and reproducible engineering in one integrated system.
+
+\end{document}
