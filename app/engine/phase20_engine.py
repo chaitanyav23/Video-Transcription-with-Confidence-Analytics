@@ -64,11 +64,13 @@ class Phase20SpeechEngine(BaseSpeechEngine):
         hf_token: Optional[str] = None,
         calibrator: Optional[ConfidenceCalibrator] = None,
         confidence_threshold: float = 0.70,
+        enable_diarization: bool = True,
     ) -> None:
         self.model_size = model_size
         self.confidence_threshold = confidence_threshold
         self.calibrator = calibrator or ConfidenceCalibrator()
         self.hf_token = hf_token or os.environ.get("HF_TOKEN")
+        self.enable_diarization = enable_diarization
 
         # Determine compute device and precision
         try:
@@ -95,6 +97,19 @@ class Phase20SpeechEngine(BaseSpeechEngine):
 
         self._whisper_model = None
         self._aligner = None
+        self._nemo_diarizer = None
+        self.enable_diarization = True
+
+    def _get_nemo_diarizer(self):
+        """Lazy load NeMo MSDD diarizer adapter."""
+        if self._nemo_diarizer is None:
+            try:
+                from engine.nemo_diarizer import NemoMsddDiarizer
+            except ImportError:
+                from app.engine.nemo_diarizer import NemoMsddDiarizer
+
+            self._nemo_diarizer = NemoMsddDiarizer(device=self.device)
+        return self._nemo_diarizer
 
     def _get_aligner(self):
         """Lazy load native Wav2Vec2 CTC forced aligner."""
@@ -497,6 +512,7 @@ class Phase20SpeechEngine(BaseSpeechEngine):
             "speaker_distribution": speaker_dist,
             "alignment_model": "wav2vec2_fairseq_base_ls960_asr_ls960.pth",
             "alignment_method": "Native-Wav2Vec2-CTC",
+            "diarization_model": "diar_msdd_telephonic.nemo + TitaNet-Large",
             "diarization_status": diar_status,
             "diarization_blocker": diar_blocker,
         }
@@ -531,12 +547,60 @@ class Phase20SpeechEngine(BaseSpeechEngine):
         duration: float,
     ) -> Tuple[List[Dict[str, Any]], str, Optional[str]]:
         """
-        Load speaker intervals from RTTM if available, or expose explicit blocker.
+        Derive speaker intervals via external RTTM, isolated NeMo MSDD, or authenticated Pyannote.
         """
+        # 1. External RTTM
         if diarization_rttm and diarization_rttm.exists():
             return (self._parse_rttm(diarization_rttm), "EXTERNAL_RTTM", None)
 
-        # Check if pyannote-audio is available with token
+        # 2. Isolated NeMo MSDD / TitaNet Diarization
+        if self.enable_diarization:
+            diarizer = self._get_nemo_diarizer()
+            available, reason = diarizer.is_available()
+            if available:
+                logger.info("Executing isolated NeMo MSDD / TitaNet speaker diarization...")
+                vad_intervals = []
+                try:
+                    import soundfile as sf
+                    import faster_whisper.vad as fw_vad
+
+                    wav_data, sr = sf.read(str(audio_path), dtype="float32")
+                    if wav_data.ndim > 1:
+                        wav_data = wav_data.mean(axis=1)
+                    vad_ts = fw_vad.get_speech_timestamps(
+                        wav_data,
+                        fw_vad.VadOptions(min_silence_duration_ms=300, speech_pad_ms=200),
+                    )
+                    vad_intervals = [
+                        {"start": round(item["start"] / sr, 3), "end": round(item["end"] / sr, 3)}
+                        for item in vad_ts
+                    ]
+                except Exception as exc:
+                    logger.warning("Silero VAD extraction failed (%s); using ASR segments for VAD.", exc)
+                    vad_intervals = [{"start": s["start"], "end": s["end"]} for s in raw_segments]
+
+                segments, status, blocker, stats = diarizer.diarize(
+                    audio_path=audio_path,
+                    vad_intervals=vad_intervals,
+                )
+                if status == "DIARIZATION_AVAILABLE" and segments:
+                    logger.info(
+                        "NeMo MSDD diarization succeeded: %d turns, %d speakers (%s).",
+                        len(segments),
+                        stats.get("speaker_count", 0),
+                        ", ".join(stats.get("speakers", [])),
+                    )
+                    return (segments, "DIARIZATION_AVAILABLE", None)
+                elif status == "DIARIZATION_FAILED":
+                    logger.warning("NeMo MSDD diarization failed: %s", blocker)
+                    segments = [{
+                        "start": 0.0,
+                        "end": round(duration, 3),
+                        "speaker": "SPEAKER_UNASSIGNED",
+                    }]
+                    return (segments, "DIARIZATION_FAILED", blocker)
+
+        # 3. Check if pyannote-audio is available with token
         if self.hf_token:
             try:
                 from pyannote.audio import Pipeline
@@ -569,8 +633,8 @@ class Phase20SpeechEngine(BaseSpeechEngine):
             "end": round(duration, 3),
             "speaker": "SPEAKER_UNASSIGNED",
         }]
-        diar_status = "UNAVAILABLE_PENDING_MSDD"
-        diar_blocker = "NVIDIA NeMo MSDD / TitaNet diarization is not installed in the environment."
+        diar_status = "DIARIZATION_UNAVAILABLE"
+        diar_blocker = "NVIDIA NeMo MSDD diarizer is not available or disabled."
         return (segments, diar_status, diar_blocker)
 
     def _parse_rttm(self, rttm_path: Path) -> List[Dict[str, Any]]:

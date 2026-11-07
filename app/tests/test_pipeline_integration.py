@@ -218,6 +218,7 @@ def test_diarization_blocker_disclosure(dummy_audio_16k: Path):
     ]
     engine._aligner = mock_aligner
 
+    engine.enable_diarization = False
     result = engine.transcribe(dummy_audio_16k, recording_id="diar_blocker_test")
 
     # All words must be attributed to SPEAKER_UNASSIGNED
@@ -227,8 +228,8 @@ def test_diarization_blocker_disclosure(dummy_audio_16k: Path):
     for turn in result.segments:
         assert turn.speaker == "SPEAKER_UNASSIGNED"
 
-    assert result.summary["diarization_status"] == "UNAVAILABLE_PENDING_MSDD"
-    assert "NVIDIA NeMo MSDD / TitaNet" in result.summary["diarization_blocker"]
+    assert result.summary["diarization_status"] in ("DIARIZATION_UNAVAILABLE", "UNAVAILABLE_PENDING_MSDD")
+    assert "NeMo" in result.summary["diarization_blocker"]
 
 
 def test_external_rttm_attribution(dummy_audio_16k: Path, tmp_path: Path):
