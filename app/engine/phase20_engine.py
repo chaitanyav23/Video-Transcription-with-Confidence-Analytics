@@ -50,6 +50,123 @@ class PipelineDependencyError(RuntimeError):
     pass
 
 
+def sanitize_credential_text(text: str, token: Optional[str] = None) -> str:
+    """Sanitize secret token strings from error messages, blockers, and logs.
+
+    Replaces exact matches of the provided token string and any standard
+    Hugging Face token patterns (hf_...) with '[REDACTED_HF_TOKEN]'.
+    """
+    if not text or not isinstance(text, str):
+        return text or ""
+    sanitized = text
+    if token and isinstance(token, str) and token.strip():
+        sanitized = sanitized.replace(token.strip(), "[REDACTED_HF_TOKEN]")
+    import re
+    sanitized = re.sub(r"hf_[A-Za-z0-9]{20,}", "[REDACTED_HF_TOKEN]", sanitized)
+    return sanitized
+
+
+def ensure_hf_hub_download_compat(token: Optional[str] = None) -> bool:
+    """Ensure huggingface_hub.hf_hub_download translates use_auth_token to token idempotently.
+
+    Pyannote.audio 3.3.2 passes `use_auth_token` to `hf_hub_download()`.
+    In `huggingface_hub >= 0.24.0`, this parameter was deprecated and removed in favor of `token`.
+    This helper installs an idempotent compatibility wrapper only once.
+
+    Parameters
+    ----------
+    token : Optional[str]
+        Optional active Hugging Face token to sanitize from exception strings if patching fails.
+
+    Returns
+    -------
+    bool
+        True if the compatibility wrapper is active or was installed; False if not needed.
+    """
+    try:
+        import huggingface_hub
+    except ImportError:
+        return False
+
+    current_func = getattr(huggingface_hub, "hf_hub_download", None)
+    if current_func is None or not callable(current_func):
+        return False
+
+    # Check if already patched to prevent repeated wrapper installation
+    if getattr(current_func, "_is_pyannote_compat_wrapper", False):
+        return True
+
+    import inspect
+    try:
+        sig = inspect.signature(current_func)
+    except (ValueError, TypeError):
+        return False
+
+    # If use_auth_token is already accepted natively, no translation is needed
+    if "use_auth_token" in sig.parameters:
+        return True
+
+    # If the function does not accept token either, compatibility cannot be established safely
+    if "token" not in sig.parameters:
+        logger.error("huggingface_hub.hf_hub_download does not accept 'token' parameter.")
+        raise RuntimeError("huggingface_hub.hf_hub_download does not accept 'token' parameter.")
+
+    original_func = current_func
+
+    import functools
+
+    @functools.wraps(original_func)
+    def _compat_download(*args, **kwargs):
+        # Translate use_auth_token to token only when necessary
+        if "use_auth_token" in kwargs:
+            auth_token = kwargs.pop("use_auth_token")
+            # Preserve explicitly supplied token if already present in kwargs
+            if "token" not in kwargs and auth_token is not None:
+                kwargs["token"] = auth_token
+        return original_func(*args, **kwargs)
+
+    # Expose identity markers to guarantee idempotency and non-nested inspection
+    _compat_download._is_pyannote_compat_wrapper = True
+    _compat_download._original_func = original_func
+
+    # Install process-wide patch on huggingface_hub
+    try:
+        huggingface_hub.hf_hub_download = _compat_download
+    except Exception as exc:
+        clean_exc = sanitize_credential_text(str(exc), token)
+        logger.error(
+            "Failed to install hf_hub_download compatibility patch into huggingface_hub: %s",
+            clean_exc,
+        )
+        raise RuntimeError(
+            f"Failed to install hf_hub_download compatibility patch into huggingface_hub: {clean_exc}"
+        ) from exc
+
+    # If pyannote.audio modules have already been imported, patch their bound reference
+    import sys
+    pyannote_targets = [
+        "pyannote.audio.core.pipeline",
+        "pyannote.audio.pipelines.speaker_diarization",
+    ]
+    for mod_name in pyannote_targets:
+        mod = sys.modules.get(mod_name)
+        if mod is not None:
+            try:
+                setattr(mod, "hf_hub_download", _compat_download)
+            except Exception as exc:
+                clean_exc = sanitize_credential_text(str(exc), token)
+                logger.error(
+                    "Failed to install hf_hub_download compatibility patch into present module %s: %s",
+                    mod_name,
+                    clean_exc,
+                )
+                raise RuntimeError(
+                    f"Failed to install hf_hub_download compatibility patch into present module {mod_name}: {clean_exc}"
+                ) from exc
+
+    return True
+
+
 class Phase20SpeechEngine(BaseSpeechEngine):
     """
     Real Phase 20 Speech Processing Engine.
@@ -65,12 +182,23 @@ class Phase20SpeechEngine(BaseSpeechEngine):
         calibrator: Optional[ConfidenceCalibrator] = None,
         confidence_threshold: float = 0.70,
         enable_diarization: bool = True,
+        diarization_backend: Optional[str] = None,
     ) -> None:
         self.model_size = model_size
         self.confidence_threshold = confidence_threshold
         self.calibrator = calibrator or ConfidenceCalibrator()
-        self.hf_token = hf_token or os.environ.get("HF_TOKEN")
+
+        if hf_token is not None:
+            self.hf_token = hf_token.strip() if isinstance(hf_token, str) and hf_token.strip() else None
+        else:
+            try:
+                from backend.config import resolve_hf_token
+            except ImportError:
+                from app.backend.config import resolve_hf_token
+            self.hf_token = resolve_hf_token()
+
         self.enable_diarization = enable_diarization
+        self.diarization_backend = (diarization_backend or "nemo").lower()
 
         # Determine compute device and precision
         try:
@@ -567,94 +695,140 @@ class Phase20SpeechEngine(BaseSpeechEngine):
             logger.info("Diarization disabled by configuration; bypassing all diarization backends.")
             return (fallback_segments, "DIARIZATION_UNAVAILABLE", "Diarization disabled by configuration.")
 
-        # 3. Isolated NeMo MSDD / TitaNet Diarization
-        diarizer = self._get_nemo_diarizer()
-        available, reason = diarizer.is_available()
-        if available:
-            logger.info("Executing isolated NeMo MSDD / TitaNet speaker diarization...")
-            vad_intervals: List[Dict[str, float]] = []
-            try:
-                import soundfile as sf
-                import faster_whisper.vad as fw_vad
+        # 3. Isolated NeMo MSDD / TitaNet Diarization (Primary default)
+        if self.diarization_backend != "pyannote":
+            diarizer = self._get_nemo_diarizer()
+            available, reason = diarizer.is_available()
+            if available:
+                logger.info("Executing isolated NeMo MSDD / TitaNet speaker diarization...")
+                vad_intervals: List[Dict[str, float]] = []
+                try:
+                    import soundfile as sf
+                    import faster_whisper.vad as fw_vad
 
-                wav_data, sr = sf.read(str(audio_path), dtype="float32")
-                if wav_data.ndim > 1:
-                    wav_data = wav_data.mean(axis=1)
-                vad_ts = fw_vad.get_speech_timestamps(
-                    wav_data,
-                    fw_vad.VadOptions(min_silence_duration_ms=300, speech_pad_ms=200),
+                    wav_data, sr = sf.read(str(audio_path), dtype="float32")
+                    if wav_data.ndim > 1:
+                        wav_data = wav_data.mean(axis=1)
+                    vad_ts = fw_vad.get_speech_timestamps(
+                        wav_data,
+                        fw_vad.VadOptions(min_silence_duration_ms=300, speech_pad_ms=200),
+                    )
+
+                    # Structural validation of VAD intervals
+                    for idx, item in enumerate(vad_ts):
+                        if not isinstance(item, dict) or "start" not in item or "end" not in item:
+                            raise ValueError(f"VAD returned malformed interval at index {idx}: {item}")
+                        start_s = round(float(item["start"]) / sr, 3)
+                        end_s = round(float(item["end"]) / sr, 3)
+                        if start_s < 0 or end_s < 0:
+                            raise ValueError(f"Negative VAD timestamp at index {idx}: [{start_s}, {end_s}]")
+                        if start_s >= end_s:
+                            raise ValueError(f"Invalid VAD duration at index {idx}: [{start_s}, {end_s}]")
+                        vad_intervals.append({"start": start_s, "end": end_s})
+
+                except Exception as exc:
+                    logger.error("Genuine VAD extraction failed: %s. Aborting diarization.", exc)
+                    return (fallback_segments, "DIARIZATION_FAILED", f"Voice Activity Detection failed: {exc}")
+
+                if len(vad_intervals) == 0:
+                    logger.info("VAD detected 0 speech intervals in audio; no speech to diarize.")
+                    return (fallback_segments, "NO_SPEECH", "No speech intervals detected by VAD.")
+
+                segments, status, blocker, stats = diarizer.diarize(
+                    audio_path=audio_path,
+                    vad_intervals=vad_intervals,
                 )
+                if status == "DIARIZATION_AVAILABLE" and segments:
+                    logger.info(
+                        "NeMo MSDD diarization succeeded: %d turns, %d speakers (%s).",
+                        len(segments),
+                        stats.get("speaker_count", 0),
+                        ", ".join(stats.get("speakers", [])),
+                    )
+                    return (segments, "DIARIZATION_AVAILABLE", None)
+                elif status == "NO_SPEECH":
+                    logger.info("NeMo MSDD diarizer reported NO_SPEECH: %s", blocker)
+                    return (fallback_segments, "NO_SPEECH", blocker or "No speech intervals detected by VAD.")
+                elif status == "DIARIZATION_FAILED":
+                    logger.warning("NeMo MSDD diarization failed: %s", blocker)
+                    return (fallback_segments, "DIARIZATION_FAILED", blocker)
 
-                # Structural validation of VAD intervals
-                for idx, item in enumerate(vad_ts):
-                    if not isinstance(item, dict) or "start" not in item or "end" not in item:
-                        raise ValueError(f"VAD returned malformed interval at index {idx}: {item}")
-                    start_s = round(float(item["start"]) / sr, 3)
-                    end_s = round(float(item["end"]) / sr, 3)
-                    if start_s < 0 or end_s < 0:
-                        raise ValueError(f"Negative VAD timestamp at index {idx}: [{start_s}, {end_s}]")
-                    if start_s >= end_s:
-                        raise ValueError(f"Invalid VAD duration at index {idx}: [{start_s}, {end_s}]")
-                    vad_intervals.append({"start": start_s, "end": end_s})
-
-            except Exception as exc:
-                logger.error("Genuine VAD extraction failed: %s. Aborting diarization.", exc)
-                return (fallback_segments, "DIARIZATION_FAILED", f"Voice Activity Detection failed: {exc}")
-
-            if len(vad_intervals) == 0:
-                logger.info("VAD detected 0 speech intervals in audio; no speech to diarize.")
-                return (fallback_segments, "NO_SPEECH", "No speech intervals detected by VAD.")
-
-            segments, status, blocker, stats = diarizer.diarize(
-                audio_path=audio_path,
-                vad_intervals=vad_intervals,
+        # 4. Gated Pyannote Diarization (Fallback or explicit backend)
+        if not self.hf_token:
+            logger.warning("Gated Pyannote speaker diarization requested, but no Hugging Face token is available.")
+            diar_status = "DIARIZATION_FAILED" if self.diarization_backend == "pyannote" else "DIARIZATION_UNAVAILABLE"
+            diar_blocker = (
+                "Hugging Face authentication required for gated Pyannote diarization. "
+                "No token was found in HF_TOKEN, HUGGINGFACE_HUB_TOKEN, or local Hugging Face cache. "
+                "Please configure HF_TOKEN or run 'huggingface-cli login'."
             )
-            if status == "DIARIZATION_AVAILABLE" and segments:
-                logger.info(
-                    "NeMo MSDD diarization succeeded: %d turns, %d speakers (%s).",
-                    len(segments),
-                    stats.get("speaker_count", 0),
-                    ", ".join(stats.get("speakers", [])),
+            return (fallback_segments, diar_status, diar_blocker)
+
+        try:
+            # Ensure idempotent compatibility with pyannote.audio 3.3.2 if huggingface_hub dropped use_auth_token
+            ensure_hf_hub_download_compat(token=self.hf_token)
+
+            from pyannote.audio import Pipeline
+            import torch
+
+            logger.info("Running real Pyannote speaker diarization with resolved Hugging Face token...")
+            pipeline = Pipeline.from_pretrained(
+                "pyannote/speaker-diarization-3.1",
+                use_auth_token=self.hf_token,
+            )
+            if pipeline is None:
+                auth_err = (
+                    "Could not load 'pyannote/speaker-diarization-3.1' pipeline. "
+                    "Ensure your Hugging Face account has accepted the user conditions at "
+                    "https://hf.co/pyannote/speaker-diarization-3.1 and https://hf.co/pyannote/segmentation-3.0."
                 )
-                return (segments, "DIARIZATION_AVAILABLE", None)
-            elif status == "NO_SPEECH":
-                logger.info("NeMo MSDD diarizer reported NO_SPEECH: %s", blocker)
-                return (fallback_segments, "NO_SPEECH", blocker or "No speech intervals detected by VAD.")
-            elif status == "DIARIZATION_FAILED":
-                logger.warning("NeMo MSDD diarization failed: %s", blocker)
-                return (fallback_segments, "DIARIZATION_FAILED", blocker)
+                logger.error("%s", auth_err)
+                return (fallback_segments, "DIARIZATION_FAILED", auth_err)
 
-        # 4. Check if pyannote-audio is available with token (only when enable_diarization=True)
-        if self.hf_token:
-            try:
-                from pyannote.audio import Pipeline
-                import torch
+            if self.device == "cuda" and torch.cuda.is_available():
+                pipeline.to(torch.device("cuda"))
+            diar = pipeline(str(audio_path))
+            segments = []
+            for turn, _, speaker in diar.itertracks(yield_label=True):
+                segments.append({
+                    "start": round(turn.start, 3),
+                    "end": round(turn.end, 3),
+                    "speaker": speaker,
+                })
+            if segments:
+                return (segments, "PYANNOTE_COMMUNITY_DIARIZATION", None)
+            else:
+                return (fallback_segments, "NO_SPEECH", "Pyannote produced 0 speaker segments.")
 
-                logger.info("Running real Pyannote speaker diarization...")
-                pipeline = Pipeline.from_pretrained(
-                    "pyannote/speaker-diarization-3.1",
-                    use_auth_token=self.hf_token,
+        except Exception as exc:
+            exc_str = str(exc)
+            status_code = getattr(getattr(exc, "response", None), "status_code", None)
+            if status_code == 401 or "401" in exc_str or "Unauthorized" in exc_str or "Invalid token" in exc_str:
+                auth_err = (
+                    "Hugging Face authentication failed (HTTP 401 Unauthorized): "
+                    "The provided Hugging Face token is invalid, expired, or revoked."
                 )
-                if self.device == "cuda" and torch.cuda.is_available():
-                    pipeline.to(torch.device("cuda"))
-                diar = pipeline(str(audio_path))
-                segments = []
-                for turn, _, speaker in diar.itertracks(yield_label=True):
-                    segments.append({
-                        "start": round(turn.start, 3),
-                        "end": round(turn.end, 3),
-                        "speaker": speaker,
-                    })
-                if segments:
-                    return (segments, "PYANNOTE_COMMUNITY_DIARIZATION", None)
-            except Exception as exc:
-                logger.warning("Pyannote diarization failed or unauthenticated (%s).", exc)
+            elif (
+                status_code == 403
+                or "403" in exc_str
+                or "GatedRepoError" in type(exc).__name__
+                or "gated" in exc_str.lower()
+                or "restricted" in exc_str.lower()
+            ):
+                auth_err = (
+                    "Access to gated model 'pyannote/speaker-diarization-3.1' denied (HTTP 403 Forbidden). "
+                    "The token is authenticated, but user conditions have not been accepted. "
+                    "Please visit https://hf.co/pyannote/speaker-diarization-3.1 to accept user terms."
+                )
+            else:
+                exc_cls_name = type(exc).__name__
+                clean_exc_str = sanitize_credential_text(exc_str, self.hf_token)
+                auth_err = f"Pyannote diarization failed ({exc_cls_name}): {clean_exc_str}"
 
-        # Diarization is unavailable: do NOT fabricate speaker labels.
-        # Mark speaker as SPEAKER_UNASSIGNED across the audio duration.
-        diar_status = "DIARIZATION_UNAVAILABLE"
-        diar_blocker = reason or "NVIDIA NeMo MSDD diarizer is not available or disabled."
-        return (fallback_segments, diar_status, diar_blocker)
+            # Always sanitize the final auth_err message before logging and returning
+            auth_err = sanitize_credential_text(auth_err, self.hf_token)
+            logger.error("Pyannote diarization error: %s", auth_err)
+            return (fallback_segments, "DIARIZATION_FAILED", auth_err)
 
     def _parse_rttm(self, rttm_path: Path) -> List[Dict[str, Any]]:
         """Parse standard NIST RTTM file into list of segment dicts."""
