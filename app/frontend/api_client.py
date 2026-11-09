@@ -39,8 +39,10 @@ class APIClient:
         resp.raise_for_status()
         return resp.json()
 
-    def get_job_status(self, job_or_rec_id: str) -> dict[str, Any]:
+    def get_job_status(self, job_or_rec_id: str) -> Optional[dict[str, Any]]:
         resp = requests.get(f"{self.base_url}/api/v1/transcriptions/{job_or_rec_id}/status", timeout=5)
+        if resp.status_code == 404:
+            return None
         resp.raise_for_status()
         return resp.json()
 
@@ -48,8 +50,8 @@ class APIClient:
         resp = requests.get(f"{self.base_url}/api/v1/transcriptions/{recording_id}", timeout=10)
         if resp.status_code == 200:
             return resp.json()
-        elif resp.status_code == 202:
-            return None  # In progress
+        elif resp.status_code in (202, 404):
+            return None  # In progress (202) or not yet transcribed / not found (404)
         resp.raise_for_status()
         return None
 

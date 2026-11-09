@@ -88,6 +88,13 @@ action_tab = st.radio(
     horizontal=True,
 )
 
+# Reset active selection when workflow mode changes to prevent stale data cross-talk
+if "active_mode" in st.session_state and st.session_state["active_mode"] != action_tab:
+    st.session_state["recording_id"] = None
+    st.session_state["job_id"] = None
+    st.session_state["filename"] = None
+st.session_state["active_mode"] = action_tab
+
 current_recording_id: str | None = None
 current_filename: str | None = None
 
@@ -123,8 +130,9 @@ if action_tab == "🎯 Select Benchmark Audio Recording":
                     st.session_state["recording_id"] = rec_id
                     st.session_state["filename"] = upload_res["filename"]
 
-                    # Trigger real transcription job
-                    client.trigger_transcription(rec_id, use_mock=False, initial_prompt=domain_prompt)
+                    # Trigger real transcription job and explicitly track job_id
+                    job_res = client.trigger_transcription(rec_id, use_mock=False, initial_prompt=domain_prompt)
+                    st.session_state["job_id"] = job_res.get("job_id")
                     st.success(f"Job submitted for {chosen_path.name}! Polling real inference progress...")
                     st.rerun()
                 except Exception as e:
@@ -147,7 +155,9 @@ elif action_tab == "📤 Upload New Audio / Video":
                     st.session_state["recording_id"] = rec_id
                     st.session_state["filename"] = upload_res["filename"]
                     
-                    client.trigger_transcription(rec_id, use_mock=False, initial_prompt=domain_prompt)
+                    # Trigger real transcription job and explicitly track job_id
+                    job_res = client.trigger_transcription(rec_id, use_mock=False, initial_prompt=domain_prompt)
+                    st.session_state["job_id"] = job_res.get("job_id")
                     st.success("Recording uploaded and Phase 20 pipeline dispatched!")
                     st.rerun()
                 except Exception as e:
@@ -158,42 +168,105 @@ elif action_tab == "📂 Past Ingested Recordings":
         recordings = client.list_recordings()
         if recordings:
             rec_options = {f"{r['filename']} ({r['recording_id'][:8]}...) - {r['duration']:.1f}s": r["recording_id"] for r in recordings}
-            selected_label = st.selectbox("Select Recording", list(rec_options.keys()))
+            rec_labels = list(rec_options.keys())
+
+            # Synchronize selector index with active session state if present
+            current_id = st.session_state.get("recording_id")
+            default_idx = 0
+            if current_id:
+                for idx, r_id in enumerate(rec_options.values()):
+                    if r_id == current_id:
+                        default_idx = idx
+                        break
+
+            selected_label = st.selectbox("Select Recording", rec_labels, index=default_idx, key="past_recording_selector")
             if selected_label:
-                st.session_state["recording_id"] = rec_options[selected_label]
-                st.session_state["filename"] = selected_label.split(" (")[0]
+                selected_rec_id = rec_options[selected_label]
+                # If selection switched to a different recording, clear active job state
+                if st.session_state.get("recording_id") != selected_rec_id:
+                    st.session_state["recording_id"] = selected_rec_id
+                    st.session_state["filename"] = selected_label.split(" (")[0]
+                    st.session_state["job_id"] = None
+                elif not st.session_state.get("filename"):
+                    st.session_state["filename"] = selected_label.split(" (")[0]
         else:
             st.info("No past recordings found. Upload a recording or run the sample demo.")
     except Exception as e:
         st.warning(f"Could not load recording list: {e}")
 
 current_recording_id = st.session_state.get("recording_id")
+current_job_id = st.session_state.get("job_id")
 current_filename = st.session_state.get("filename", "recording.wav")
 
 if not current_recording_id:
     st.info("Please load a sample recording or upload media above to view results.")
     st.stop()
 
-# ---------------------------------------------------------------- Polling & Job Status
-job_status = client.get_job_status(current_recording_id)
-status_val = job_status.get("status", "unknown")
-progress_val = float(job_status.get("progress", 0.0))
-stage_val = job_status.get("stage", "idle")
-
-if status_val in ("queued", "processing"):
-    st.warning(f"⏳ **Processing in progress:** {stage_val}")
-    st.progress(progress_val)
-    time.sleep(1.0)
-    st.rerun()
-elif status_val == "failed":
-    st.error(f"❌ Processing failed: {job_status.get('error')}")
+# ---------------------------------------------------------------- Transcript-First Resolution
+transcript_res = None
+try:
+    transcript_res = client.get_transcript(current_recording_id)
+except requests.exceptions.HTTPError as http_err:
+    st.error(f"Failed to retrieve transcript: {http_err}")
+    st.stop()
+except Exception as exc:
+    st.error(f"Unexpected error while retrieving transcript: {exc}")
     st.stop()
 
-# Retrieve Transcript Result
-transcript_res = client.get_transcript(current_recording_id)
+# If transcript is not yet available, check whether a processing job exists
+if not transcript_res:
+    # Use explicit job_id if tracked, otherwise fall back to recording_id
+    poll_target = current_job_id if current_job_id else current_recording_id
+    job_status = None
+    try:
+        job_status = client.get_job_status(poll_target)
+    except requests.exceptions.HTTPError as http_err:
+        st.error(f"Failed to query job status: {http_err}")
+        st.stop()
+    except Exception as exc:
+        st.error(f"Unexpected error checking job status: {exc}")
+        st.stop()
+
+    if job_status is not None:
+        status_val = job_status.get("status", "unknown")
+        progress_val = float(job_status.get("progress", 0.0))
+        stage_val = job_status.get("stage", "idle")
+
+        if status_val in ("queued", "processing"):
+            st.warning(f"⏳ **Processing in progress:** {stage_val}")
+            st.progress(progress_val)
+            time.sleep(1.0)
+            st.rerun()
+        elif status_val == "failed":
+            st.error(f"❌ Processing failed: {job_status.get('error')}")
+            st.stop()
+        elif status_val == "completed":
+            # Retry fetching transcript once job completes
+            transcript_res = client.get_transcript(current_recording_id)
+            if not transcript_res:
+                time.sleep(0.5)
+                st.rerun()
+    else:
+        # Ingested recording has no active job and no completed transcript
+        st.info("ℹ️ **Not transcribed yet.** This recording has been ingested but has not been transcribed.")
+        if st.button("Run Phase 20 Pipeline on this Recording", type="primary"):
+            with st.spinner("Submitting transcription job..."):
+                try:
+                    job_res = client.trigger_transcription(current_recording_id, use_mock=False, initial_prompt=domain_prompt)
+                    st.session_state["job_id"] = job_res.get("job_id")
+                    st.success("Transcription job submitted! Polling progress...")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Failed to submit transcription job: {exc}")
+        st.stop()
+
 if not transcript_res:
     st.info("No transcript found yet.")
     st.stop()
+
+# Clear active job_id once transcript is loaded to avoid stale task ID persistence
+if st.session_state.get("job_id"):
+    st.session_state["job_id"] = None
 
 # Load DataFrames
 raw_words = transcript_res.get("words", [])
